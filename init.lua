@@ -240,6 +240,7 @@ local TAG_OPEN_ECHO     = string.byte "{"
 local TAG_CLOSE_ECHO    = string.byte "}"
 local TAG_OPEN_CONTROL  = string.byte "%"
 local TAG_OPEN_COMMENT  = string.byte "#"
+local TAG_CLOSE_COMMENT = string.byte "#"
 
 -- token type / what are we currently reading
 local tokens = {
@@ -265,6 +266,7 @@ function Scanner:addToken(type, data)
 end
 
 function Scanner:packTokens()
+    p("PRE_PACK", self.tokens)
     local removed = {}
     for i, token in pairs(self.tokens) do
         if token[1] == "TOKEN_MIXED_OPEN" and (token[2] == "TOKEN_CONTROL_INNER" or token[2] == "TOKEN_COMMENT_INNER") then
@@ -388,7 +390,7 @@ function Scanner:readOpenTag(chunk)
         self:addToken("TOKEN_MIXED_OPEN", "TOKEN_COMMENT_INNER")
         self.status:swap("TOKEN_COMMENT_INNER")
     else
-        return self:error(chunk, "Invalid opening tag", {TAG_OPEN_ECHO, TAG_OPEN_CONTROL})
+        return self:error(chunk, "Invalid opening tag", {TAG_OPEN_ECHO, TAG_OPEN_CONTROL, TAG_OPEN_ECHO})
     end
     chunk:skip()
 end
@@ -399,10 +401,8 @@ function Scanner:readClosingTag(chunk)
     assert(chunk:next() == close)
     
     if chunk:next() == TAG_CLOSE then
-        if self.status ~= "TOKEN_COMMENT_INNER" then
-            self:addToken("TOKEN_MIXED_CLOSE")
-            self:packTokens()
-        end
+        self:addToken("TOKEN_MIXED_CLOSE")
+        self:packTokens()
         self.status:pop()
         return true
     end
@@ -416,21 +416,21 @@ function Scanner:skipWhitespace(chunk)
     end)
 end
 
-function Scanner:skipComment(chunk)
-    chunk:readWhile(function(c)
-        return c ~= TAG_OPEN_COMMENT
-    end)
-
-    if chunk:peek() == TAG_OPEN_COMMENT then
-        local saved = chunk:save()
-        chunk:skip()
-        if not chunk:left() then
-            chunk:restore(saved)
-        elseif chunk:next() == TAG_CLOSE then
-            self.status:pop()
-        end        
-    end
-end
+-- function Scanner:skipComment(chunk)
+--     chunk:readWhile(function(c)
+--         return c ~= TAG_OPEN_COMMENT
+--     end)
+-- 
+--     if chunk:peek() == TAG_OPEN_COMMENT then
+--         local saved = chunk:save()
+--         chunk:skip()
+--         if not chunk:left() then
+--             chunk:restore(saved)
+--         elseif chunk:next() == TAG_CLOSE then
+--             self.status:pop()
+--         end        
+--     end
+-- end
 
 function Scanner:isStartOfWord(c)
     return isAlphaNumeric(c)
@@ -475,7 +475,7 @@ function Scanner:parseString(buffer)
 end
 
 function Scanner:getCurrentClosingTag()
-    return (self.status:is("TOKEN_CONTROL_INNER") and TAG_OPEN_CONTROL) or (self.status:is("TOKEN_ECHO_INNER") and TAG_CLOSE_ECHO)
+    return (self.status:is("TOKEN_CONTROL_INNER") and TAG_OPEN_CONTROL) or (self.status:is("TOKEN_ECHO_INNER") and TAG_CLOSE_ECHO) or (self.status:is("TOKEN_COMMENT_INNER") and TAG_CLOSE_COMMENT)
 end
 
 function Scanner:mayBeClosingTag(c)
@@ -498,9 +498,13 @@ function Scanner:readBody(chunk)
     self:skipWhitespace(chunk)
     if chunk:left() then
         if self.status:is("TOKEN_COMMENT_INNER") then
-            chunk:readWhile(function(c)
+            local blob = chunk:readWhile(function(c)
                 return not self:mayBeClosingTag(c)
             end)
+            
+            if blob:length() > 0 then
+                self:addToken("TOKEN_BLOB", blob)
+            end
             
             if self:mayBeClosingTag(chunk:peek()) then
                 self:readClosingTag(chunk)
@@ -545,8 +549,6 @@ function Scanner:parseChunk(chunk)
             self:readRawData(chunk)
         elseif self.status:is("TOKEN_MIXED_OPEN") then
             self:readOpenTag(chunk)
-        elseif self.status:is("TOKEN_COMMENT_INNER") then
-            self:skipComment(chunk)
         else
             self:readBody(chunk)
         end
@@ -807,11 +809,11 @@ function LuaCompiler:compileString(instance)
 end
 
 function LuaCompiler:compileExtends(instance)
-    self:add(("ichtRE.extends %s"):format(self:formatArgument(instance.path)))
+    self:add(("ichtRE._extends %s"):format(self:formatArgument(instance.path)))
 end
 
 function LuaCompiler:compileBlock(instance)
-    self:add(("ichtRE._block(%q, function(BLOCK_NAME, PARENT)"):format(instance.path))
+    self:add(("ichtRE._block(%q, function(ichtRE, BLOCK_NAME, PARENT)"):format(instance.path))
     self:compileChildren(instance)
     self:add("end)")
 end
@@ -895,6 +897,7 @@ end
 
 function LuaCompiler:finish()
     if self.options.writeHeader then
+        self:add("ichtRE._runParent()")
         self:add("end}")
     end
 end
@@ -929,7 +932,35 @@ stream:on("data", function(chunk)
     require "luvit.fs".writeFileSync("resources/lua/web/templates/test.html.tpl.lua", code)
     
     local f = compiler:run()
-    p(f, f())
+    local runtime = require "icht.runtime".makeRuntime()
+    function runtime.e(v)
+        return "Escaped("..tostring(v)..")"
+    end
+    function runtime:onOutput(v)
+        print (v)
+    end
+    function runtime:runParent(name, runtime)
+        local buffer = Buffer:new([[
+            <html><body>{% block main %}{% endblock %}</body></html>
+        ]])
+        local scanner = Scanner:new()
+        scanner:parseChunk(buffer)
+        local parser = Parser:new()
+        parser:parse(TableBuffer:new(scanner.tokens))
+        
+        local compiler = LuaCompiler:new()
+        compiler:compile(parser.tree)
+        compiler:finish()
+        
+        local code = compiler:toString()
+        
+        require "luvit.fs".writeFileSync("resources/lua/web/templates/main.html.tpl.lua", code)
+        
+        local f = compiler:run()
+        f().run(runtime)
+    end
+    runtime.testlist = {{"Hello", "World"}}
+    p(f, f().run(runtime))
 end)
 
 require "luvit.timer".setInterval(1000, function() p "collectgarbage" collectgarbage() end)
