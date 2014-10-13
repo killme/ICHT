@@ -95,7 +95,12 @@ Buffer = ffi.metatype("_ichts_buffer_container", {
                 return new
             end,
             save = function(self)
-                return self:new(self)
+                local new = self:new(self)
+                new.head = self.head
+                new.tail = self.tail
+                new.line = self.line
+                new.col = self.col
+                return new
             end,
             restore = function(self, saved)
                 assert(self.buffer == saved.buffer, "wut, not same?")
@@ -119,7 +124,7 @@ Buffer = ffi.metatype("_ichts_buffer_container", {
                 return char
             end,
             peek = function(self)
-                return self.head ~= nil and self.head[0] or nil
+                return self.head ~= self.tail and self.head[0] or nil
             end,
             skip = function(self, char)
                 if self:left() then
@@ -129,12 +134,12 @@ Buffer = ffi.metatype("_ichts_buffer_container", {
                     self.col = self.col + 1
                     self.head = self.head + 1
                     if self.head >= self.tail then
-                        self.head = nil
+                        self.head = self.tail
                     end
                 end
             end,
             left = function(self)
-                return self.head ~= nil 
+                return self.head ~= self.tail
             end,
             readWhile = function(self, condition)
                 local oldHead = self.head
@@ -266,7 +271,6 @@ function Scanner:addToken(type, data)
 end
 
 function Scanner:packTokens()
-    p("PRE_PACK", self.tokens)
     local removed = {}
     for i, token in pairs(self.tokens) do
         if token[1] == "TOKEN_MIXED_OPEN" and (token[2] == "TOKEN_CONTROL_INNER" or token[2] == "TOKEN_COMMENT_INNER") then
@@ -368,6 +372,7 @@ function Scanner:readRawData(chunk)
         return char ~= TAG_OPEN
     end)
     
+    assert(blob:length() >= 0)
     if blob:length() > 0 then
         self:addToken("TOKEN_BLOB", blob)
     end
@@ -524,7 +529,7 @@ function Scanner:readBody(chunk)
                 if self:mayBeClosingTag(c) then
                     if not self:readClosingTag(chunk) then
                         local hadLeft = chunk:left()
-                        p(chunk, saved)
+
                         chunk:restore(saved)
                         
                         if hadLeft then
