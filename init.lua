@@ -4,8 +4,11 @@
     Neither completely stable nor standards compliant (I really should read the docs one day)
 ]]
 local Object = require "luvit.core".Object
+local Emitter = require "luvit.core".Emitter
+local Error = require('luvit.core').Error
 local ffi = require "ffi"
-require "luvit.utils".DUMP_MAX_DEPTH = 3
+local fs = require "luvit.fs"
+local uv = require "luvit.uv"
 
 local function isAlpha(c)
     if type(c) == "nil" then return false end
@@ -257,7 +260,7 @@ local tokens = {
     "TOKEN_MIXED_CLOSE",
 }
 
-local Scanner = require "luvit.core".Object:extend()
+local Scanner = Object:extend()
 
 function Scanner:initialize()
     self.tokens = {}
@@ -322,12 +325,18 @@ end
 
 function Scanner:toPrintable(buffer, sep)
     local out = {}
-    
-    local s = buffer:save()
-    while buffer:left() do
-        out[#out+1] = string.char(buffer:next())
+
+    if type(buffer) == "table" then
+        for k, v in pairs(buffer) do
+            out[#out+1] = string.char(v)
+        end
+    else
+        local s = buffer:save()
+        while buffer:left() do
+            out[#out+1] = string.char(buffer:next())
+        end
+        buffer:restore(s)
     end
-    buffer:restore(s)
     
     return table.concat(out, sep or "")
 end
@@ -438,7 +447,7 @@ end
 -- end
 
 function Scanner:isStartOfWord(c)
-    return isAlphaNumeric(c)
+    return isAlphaNumeric(c) or c == string.byte "_"
 end
 
 function Scanner:parseWord(buffer)
@@ -539,7 +548,7 @@ function Scanner:readBody(chunk)
                         end
                     end
                 else
-                    p("C", self:toPrintable({c}), chunk.currentPosition - chunk.buffer, self.status)
+                    p("C", self:toPrintable({c}), chunk.head - chunk.buffer.buffer, self.status)
                     chunk:skip()
                 end
             end
@@ -560,8 +569,6 @@ function Scanner:parseChunk(chunk)
     end
     self.abort = false
 end
-
-local stream = require "luvit.fs".createReadStream("resources/lua/web/templates/test.html.tpl")
 
 local Parser = Object:extend()
 
@@ -777,9 +784,9 @@ function LuaCompiler:initialize(options)
     self.options = options or {
         writeHeader = true
     }
+    assert(self.options.source, "Must specify a source location.")
     if self.options.writeHeader then
-        self:add(("return { source=%q, run = function(ichtRE)"):format("TODO" --TODO: implement
-        ))
+        self:add(("return { source=%q, run = function(ichtRE)"):format(self.options.source))
     end
     self.locals = {}
 end
@@ -806,7 +813,7 @@ function LuaCompiler:formatArgument(value, isString)
 end
 
 function LuaCompiler:compileBlob(instance)
-    self:add(("ichtRE.write %s"):format(self:formatArgument(instance.value, true)))
+    self:add(("ichtRE:write %s"):format(self:formatArgument(instance.value, true)))
 end
 
 function LuaCompiler:compileString(instance)
@@ -814,17 +821,20 @@ function LuaCompiler:compileString(instance)
 end
 
 function LuaCompiler:compileExtends(instance)
-    self:add(("ichtRE._extends %s"):format(self:formatArgument(instance.path)))
+    self:add(("ichtRE:_extends %s"):format(self:formatArgument(instance.path)))
 end
 
 function LuaCompiler:compileBlock(instance)
-    self:add(("ichtRE._block(%q, function(ichtRE, BLOCK_NAME, PARENT)"):format(instance.path))
+    self:add(("ichtRE:_block(%q, function(ichtRE, BLOCK_NAME, PARENT)"):format(instance.path))
+    local wasLocalName, wasLocalParent = self.locals["BLOCK_NAME"], self.locals["PARENT"]
+    self.locals["BLOCK_NAME"], self.locals["PARENT"] = true, true
     self:compileChildren(instance)
+    self.locals["BLOCK_NAME"], self.locals["PARENT"] = wasLocalName, wasLocalParent
     self:add("end)")
 end
 
 function LuaCompiler:compileFor(instance)
-    self:add(("ichtRE._for(%s, function(%s)"):format(self:formatArgument(instance.from), table.concat(instance.unpack, ", ")))
+    self:add(("ichtRE:_for(%s, function(%s)"):format(self:formatArgument(instance.from), table.concat(instance.unpack, ", ")))
     self.locals = { __index = self.locals }
     for k, v in pairs(instance.unpack) do
         self.locals[v] = true
@@ -842,7 +852,7 @@ function LuaCompiler:compileChildren(tree)
 end
 
 function LuaCompiler:compileEcho(tree)
-    self:add("ichtRE.write (")
+    self:add("ichtRE:write (")
     for k, child in pairs(tree.children) do
         self:compile(child)
         self:add(", ")
@@ -902,7 +912,7 @@ end
 
 function LuaCompiler:finish()
     if self.options.writeHeader then
-        self:add("ichtRE._runParent()")
+        self:add("ichtRE:_runParent()")
         self:add("end}")
     end
 end
@@ -911,61 +921,146 @@ function LuaCompiler:toString()
     return table.concat(self.output, " ")
 end
 
-function LuaCompiler:run()
-    return assert(loadstring(self:toString()))
+local Environment = Object:extend()
+
+function Environment:initialize(options)
+    self.store = options.store
 end
 
-stream:on("data", function(chunk)
-    local buffer = Buffer:new(chunk)
-    local scanner = Scanner:new()
-    scanner:parseChunk(buffer)
-    p(scanner.tokens)
-    local parser = Parser:new()
-    parser:parse(TableBuffer:new(scanner.tokens))
-    local maxDepth = require "luvit.utils".DUMP_MAX_DEPTH
-    require "luvit.utils".DUMP_MAX_DEPTH = 100
-    p(parser.tree, parser.currentToken)
-    require "luvit.utils".DUMP_MAX_DEPTH = maxDepth
-    
-    local compiler = LuaCompiler:new()
-    compiler:compile(parser.tree)
-    compiler:finish()
-    
-    local code = compiler:toString()
-    p(code)
-    
-    require "luvit.fs".writeFileSync("resources/lua/web/templates/test.html.tpl.lua", code)
-    
-    local f = compiler:run()
-    local runtime = require "icht.runtime".makeRuntime()
-    function runtime.e(v)
-        return "Escaped("..tostring(v)..")"
-    end
-    function runtime:onOutput(v)
-        print (v)
-    end
-    function runtime:runParent(name, runtime)
-        local buffer = Buffer:new([[
-            <html><body>{% block main %}{% endblock %}</body></html>
-        ]])
-        local scanner = Scanner:new()
-        scanner:parseChunk(buffer)
-        local parser = Parser:new()
-        parser:parse(TableBuffer:new(scanner.tokens))
-        
-        local compiler = LuaCompiler:new()
-        compiler:compile(parser.tree)
-        compiler:finish()
-        
-        local code = compiler:toString()
-        
-        require "luvit.fs".writeFileSync("resources/lua/web/templates/main.html.tpl.lua", code)
-        
-        local f = compiler:run()
-        f().run(runtime)
-    end
-    runtime.testlist = {{"Hello", "World"}}
-    p(f, f().run(runtime))
-end)
+function Environment:compile(storedTemplate, cb)
+    assert(not storedTemplate.valid, "Must invalidate template before recompiling.")
+    storedTemplate:openSourceStream(function(err, stream)
+        if err then
+            return cb(err)
+        end
 
-require "luvit.timer".setInterval(1000, function() p "collectgarbage" collectgarbage() end)
+        local scanner = Scanner:new()
+        local parser = Parser:new()
+        local compiler = LuaCompiler:new {
+            writeHeader = true,
+            source = storedTemplate:toSource()
+        }
+
+        stream:on("data", function(chunk)
+            local buffer = Buffer:new(chunk)
+            scanner:parseChunk(buffer)
+
+            parser:parse(TableBuffer:new(scanner.tokens))
+
+            compiler:compile(parser.tree)
+        end)
+
+        stream:on("error", function(err)
+            cb(err, nil)
+        end)
+
+        stream:on("end", function()
+            compiler:finish()
+
+            local code = compiler:toString() -- TODO: write as a stream
+
+            storedTemplate:openDestinationStream(function(err, writeStream)
+                if err then
+                    return cb(err)
+                end
+
+                writeStream:on("error", function(err)
+                    cb(err)
+                end)
+
+                writeStream:on("end", function()
+                    storedTemplate.valid = true
+                    cb(nil, code)
+                end)
+
+                writeStream:finish(code)
+            end)
+        end)
+        stream:on("error", function(err)
+            cb(err)
+        end)
+    end)
+end
+
+function Environment:load(storedTemplate, cb)
+    if not storedTemplate.valid then
+        return self:compile(storedTemplate, function(err, code)
+            if err then
+                return cb(err)
+            end
+            local f, err = loadstring(code)
+            if not f then
+                return cb(err)
+            else
+                storedTemplate.loaded = f()
+                cb(nil, storedTemplate)
+            end
+        end)
+    else
+        if storedTemplate.loaded then
+            return cb(nil, storedTemplate)
+        else
+            if storedTemplate.load then
+                storedTemplate:load(function(err, template)
+                    if err then
+                        return cb(err)
+                    else
+                        storedTemplate.loaded = template
+                        cb(nil, storedTemplate)
+                    end
+                end)
+            else
+                storedTemplate:openCompiledStream(function(err, stream)
+                    if err then
+                        return cb(err)
+                    else
+                        local code = {}
+                        stream:on("data", function(chunk)
+                            code[#code+1] = chunk
+                        end)
+                        stream:on("end", function()
+                            local f, err = loadstring(table.concat(code, ""))
+                            if not f then
+                                cb(err)
+                            else
+                                storedTemplate.loaded = f()
+                                cb(nil, storedTemplate)
+                            end
+                        end)
+                        stream:on("error", function(err)
+                            cb(err)
+                        end)
+                    end
+                end)
+            end
+        end
+    end
+end
+
+function Environment:run(storedTemplate, runtime, cb)
+    if type(storedTemplate) == "string" then
+        return self:runByName(storedTemplate, runtime, cb)
+    end
+    self:load(storedTemplate, function(err, storedTemplate)
+        if err then
+            cb(err)
+        else
+            runtime:run(storedTemplate.loaded, cb)
+        end
+    end)
+end
+
+function Environment:runByName(vpath, runtime, cb)
+    return self.store:findTemplate(vpath, function(err, storedTemplate)
+        if err then
+            cb(err)
+        else
+            return self:run(storedTemplate, runtime, cb)
+        end
+    end)
+end
+
+return {
+    LuaCompiler = LuaCompiler,
+    Environment = Environment
+}

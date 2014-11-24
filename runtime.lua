@@ -2,52 +2,73 @@
     Icht runtime
 ]]
 
-local function makeRuntime (parent)
-    local runtime = {__index = parent}
-    setmetatable(runtime, runtime)
-    runtime._blocks = runtime._blocks or {}
-    runtime.isExtending = false
+local Object = require "luvit.core".Object
 
-    runtime._extends = function(parent)
-        assert(not runtime.isExtending, "Cannot extend multiple templates.")
-        runtime.isExtending = parent
-    end
-    runtime.write = function(str)
-        if not runtime.isExtending then
-            runtime:onOutput(tostring(str))
+local function makeScope(parent)
+    return setmetatable({}, {__index=parent})
+end
+
+local Runtime = Object:extend()
+
+function Runtime:initialize(parent)
+    self.parent = parent
+    self.blocks = parent and parent.blocks or {}
+    self.isExtending = false
+end
+
+function Runtime:run(info, cb)
+    local scope = makeScope(self)
+    scope._rootscope = scope
+    scope.source = info.source
+    scope._blocks = {}
+    info.run(scope)
+    cb()
+end
+
+function Runtime:_extends(parent)
+    assert(not runtime.isExtending, "Cannot extend multiple templates.")
+    self._rootscope.isExtending = parent
+end
+
+function Runtime:write(...)
+    if not self.isExtending then
+        for k, str in pairs({...}) do
+            p("OUT self:onOutput(", tostring(str))
         end
     end
-    runtime._block = function(name, child)
-        if runtime.isExtending then
-            runtime._blocks[name] = function(runtime, ...) child(runtime, name, ...) end
-        elseif runtime._blocks[name] then
-            runtime._blocks[name](runtime, child)
-        end
+end
+
+function Runtime:_block(name, child)
+    if self.isExtending then
+        self._blocks[name] = function(runtime, ...) child(self, name, ...) end
+    elseif self._blocks[name] then
+        self._blocks[name](runtime, child)
+    else
+        child(self, name)
     end
-    runtime._for = function(v, child, doUnpack)
-        if type(v) == "table" then
-            for k, v in pairs(v) do
-                if doUnpack then
-                    child(unpack(v))
-                else
-                    child(v)
-                end
+end
+
+function Runtime:_for(v, child, doUnpack)
+    if type(v) == "table" then
+        for k, v in pairs(v) do
+            if doUnpack then
+                child(unpack(v))
+            else
+                child(v)
             end
-        else
-            p(v)
-            error "Unkown varible to for."
         end
+    else
+        p(v)
+        error "Unkown varible to for."
     end
-    runtime._runParent = function()
-        if runtime.isExtending then
-            local childRuntime = makeRuntime(runtime)
-            runtime:runParent(runtime.isExtending, childRuntime)
-        end
-    end
+end
 
-    return runtime
+function Runtime:_runParent()
+    if self.isExtending then
+        self:runParent(self.isExtending, childRuntime)
+    end
 end
 
 return {
-    makeRuntime = makeRuntime
+    Runtime = Runtime,
 }
